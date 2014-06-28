@@ -1,0 +1,804 @@
+/*
+ *  Coroutines in i386 assembly.
+ *
+ *  Using Gnu AS as the assembler as it allows gcc portability and a single
+ *  toolchain. Some routines are doable in C but where's the fun* in that.
+ *  (*your experience may differ)
+ *
+ *  Distribution and use of this software are as per the terms of the
+ *  Simplified BSD License (also known as the "2-Clause License")
+ *
+ *  Copyright 2014 Conor F. O'Rourke. All rights reserved.
+ */
+
+
+/*
+    struct coroutine_context is an opaque pointer.
+
+    extern void   __cdecl coroutine_setpanic (void (*newpanicfn)(const char *msg));
+    extern void * __cdecl coroutine_creates  (int  (*cofunction)(void *), size_t *stacksizep);
+    extern int    __cdecl coroutine_destroy  (void *coctx);
+    extern int    __cdecl coroutine_hasended (void *coctx);
+    extern void * __cdecl coroutine_getparam (void *coctx);
+    extern int    __cdecl coroutine_call     (void *coctx);
+
+    struct coroutine_context
+    {
+        int magic;
+
+        int (*cofunction)(struct coroutine_context *coctx);
+
+        unsigned char *vstackhigh;
+        unsigned char *vstacklow;
+
+        void *nextjump;
+        void *otherstack;
+
+        void *wintib;
+
+        int yielded;
+        int onvstack;
+
+        int   retvalue
+        void *extraparam;
+    }
+
+*/
+
+#if !defined(__i386__) || defined(_WIN64)
+        .error "This code runs on 32 bit x86 only"
+#endif
+
+        COROUTINE_MAGICVAL  = 0x21504854
+        COROUTINE_VDEFSIZE  = 4096
+
+        CTX_MAGIC       = 0
+        CTX_COFUNCTION  = 4
+        CTX_VSTACKHIGH  = 8
+        CTX_VSTACKLOW   = 12
+        CTX_NEXTJUMP    = 16
+        CTX_OTHERSTACK  = 20
+        CTX_WINTIB      = 24
+        CTX_YIELDED     = 28
+        CTX_ONVSTACK    = 32
+        CTX_RETVALUE    = 36
+        CTX_EXTRAPARAM  = 40
+        CTX_STRUCTSIZE  = 44
+
+        EINVAL = 22
+        ENOMEM = 12
+        EAGAIN = 11
+        EFAULT = 14
+        ERANGE = 34
+
+#ifdef _WIN32
+        WINTIB_STACKHI = 0x04
+        WINTIB_STACKLO = 0x08
+        WINTIB_TIBADDR = 0x18
+#endif
+
+
+.intel_syntax noprefix      /* When in Intel, do what Intel does */
+
+
+/*
+ *  ABI is Intel X86 32 bit: you can change eax, ecx, edx with a function.
+ *  By extension, any function you call can willfully change these.
+ *
+ *  On ELF, the C calling convention does not have leading underscores,
+ *  On Windows it does. Fastcall uses @ name decoration, ELF doesn't allow
+ *  that symbol. As it use fastcall internally, I decorate with _f instead.
+ *
+ *  Gcc, for some reason, wants function calls to be made with a 16-byte
+ *  aligned stack. The stack is aligned before the call. The call itself will,
+ *  of course, promptly unalign the stack by the size of the return address.
+ */
+
+
+        /*
+         *  .bss reserve (static global, zeroed on startup)
+         *  ELF must use .local & .comm in place of .lcomm (with alignment)
+         */
+
+#ifdef _WIN32
+        .lcomm      g_coroutine_panicfn, 4, 4
+#else
+        .local      g_coroutine_panicfn
+        .comm       g_coroutine_panicfn, 4, 4
+#endif
+
+
+        /*
+         *  .rdata data section, read-only
+         */
+
+#ifdef _WIN32
+        .section    .rdata, "dr"                /* COFF */
+#else
+        .section    .rodata                     /* ELF */
+#endif
+
+emsg_badcontext:
+        .asciz      "Coroutine context is not valid"
+emsg_outofmem:
+        .asciz      "Coroutine create ran out of memory"
+emsg_badarg:
+        .asciz      "Invalid argument to coroutine function"
+emsg_badstack:
+        .asciz      "Cannot destroy context while in coroutine"
+emsg_bigstack:
+        .asciz      "Stack size is mostly unreasonable (> 1MB)"
+
+
+
+
+        /*
+         *  Code section, read only
+         */
+
+        .text
+
+
+#if defined(_WIN32) || defined(__APPLE__)
+        /* Global calls have leading underscores */
+        #define     calloc              _calloc
+        #define     free                _free
+        #define     __errno_location    __errno
+        #define     coroutine_setpanic  _coroutine_setpanic
+        #define     coroutine_creates   _coroutine_creates
+        #define     coroutine_destroy   _coroutine_destroy
+        #define     coroutine_hasended  _coroutine_hasended
+        #define     coroutine_getparam  _coroutine_getparam
+        #define     coroutine_call      _coroutine_call
+#endif
+
+        .global     coroutine_setpanic
+        .global     coroutine_creates
+        .global     coroutine_destroy
+        .global     coroutine_hasended
+        .global     coroutine_getparam
+        .global     coroutine_call
+
+
+/**
+ *  coroutine_seterrno_f4 (fastcall,local) - Sets errno to ECX
+ *
+ *  Stack fixup - Caller does not have to prealign stack
+ */
+
+coroutine_seterrno_f4:
+
+        push    ebp                             /* Save esp in ebp as    */
+        mov     ebp, esp                        /* align is irreversible */
+
+        and     esp, ~15                        /* Force downward align  */
+        sub     esp, 12
+        push    ecx                             /* save ECX (@16 align)  */
+        call    __errno_location                /* errno ptr -> EAX      */
+        pop     ecx                             /* Get back previous ECX */
+
+        mov     [eax], ecx                      /* [errno] = ECX         */
+
+        mov     esp, ebp                        /* Restore stack and ebp */
+        pop     ebp
+        ret
+
+
+
+
+/**
+ *  coroutine_trypanic_f4 (fastcall,local) - Panics with string in ECX
+ *
+ *  Attempt to call (*g_coroutine_panicfn) with string pointer set in ECX
+ *
+ *  Stack fixup - Caller does not have to prealign stack
+ */
+
+coroutine_trypanic_f4:
+
+        mov     eax, dword ptr g_coroutine_panicfn      /* MASM syntax */
+        cmp     eax, 0
+        je      Trypanic_exit
+
+        push    ebp
+        mov     ebp, esp
+
+        and     esp, ~15                        /* Stack downward align  */
+        sub     esp, 12
+        push    ecx                             /* push string ptr (@16) */
+        call    eax                             /* Call pointer to func  */
+
+        mov     esp, ebp                        /* Restore stack and ebp */
+        pop     ebp
+
+Trypanic_exit:
+        ret
+
+
+
+
+/**
+ *  coroutine_isvalidcontext_f4 (fastcall,local) - Validate context in ECX
+ *
+ *  Returns: 1 if true; 0 if false (in EAX)
+ *           if false, sets errno and calls coroutine_trypanic
+ *
+ *  ECX is always preserved to the caller
+ *  Stack fixup - Caller does not have to prealign stack
+ */
+
+coroutine_isvalidcontext_f4:
+
+        cmp     ecx, 0
+        je      Isvalidcontext_error
+
+        cmp     dword ptr [ecx + CTX_MAGIC], COROUTINE_MAGICVAL
+        jne     Isvalidcontext_error
+
+        mov     eax, 1
+        ret
+
+Isvalidcontext_error:
+
+        push    ecx
+
+        mov     ecx, EINVAL
+        call    coroutine_seterrno_f4
+        mov     ecx, offset emsg_badcontext
+        call    coroutine_trypanic_f4
+
+        mov     eax, 0
+        pop     ecx
+        ret
+
+
+
+
+/**
+ *  coroutine_setpanic (__cdecl) - Set a global function to handle panics
+ *
+ *  Takes a pointer to the function which is stored in g_coroutine_panicfn
+ *  This can be NULL which will stop the function being called.
+ */
+
+coroutine_setpanic:
+
+        mov     ecx, [esp + 4]                  /* First arg */
+        mov     g_coroutine_panicfn, ecx        /* MASM syntax */
+        ret
+
+
+
+
+/**
+ *  coroutine_creates (__cdecl) - Creates a coroutine context block
+ *
+ *  Takes a pointer to the coroutine function and a pointer to a stacksize.
+ *  Allocates and initialises a context block and stack memory area.
+ *  The stacksize is rounded up to 4096 and stacksizep can be NULL.
+ *
+ *  Returns: an opaque pointer to the allocated context block
+ *           or NULL on error (Invalid function, no memory)
+ *           Write the actual stacksize back to the stacksizep.
+ *  On error: sets errno, calls coroutine_trypanic
+ */
+
+coroutine_creates:
+
+        push    ebp
+        mov     ebp, esp
+
+        mov     eax, [ebp + 8]                  /* First arg:  */
+        cmp     eax, 0                          /*  cofunction */
+        jne     Create_cofunc_ok
+
+        mov     ecx, EINVAL
+        call    coroutine_seterrno_f4           /* Set errno   */
+        mov     ecx, offset emsg_badarg
+        call    coroutine_trypanic_f4           /* Freak out   */
+
+        mov     eax, 0                          /* Return NULL */
+        pop     ebp
+        ret
+
+Create_cofunc_ok:
+
+        mov     edx, COROUTINE_VDEFSIZE         /* EDX = default   */
+        mov     eax, [ebp + 12]                 /* Arg: stacksizep */
+        cmp     eax, 0                          /* NULL?           */
+        je      Create_size_ok                  /* Done -> default */
+
+        cmp     dword ptr [eax], 0              /* !NULL but 0?    */
+        jne     Create_size_nonzero
+
+        mov     [eax], edx                      /* Save at stacksizep  */
+        jmp     Create_size_ok                  /* Done -> use default */
+
+Create_size_nonzero:
+
+        mov     edx, [eax]
+        add     edx, 4095                       /* Page round up */
+        and     edx, ~4095
+
+        cmp     edx, 0x100000                   /* 1MB maximum   */
+        ja      Create_size_toobig              /* ja = unsigned */
+
+        mov     [eax], edx
+        jmp     Create_size_ok                  /* Done -> have size */
+
+Create_size_toobig:
+
+        mov     ecx, ERANGE
+        call    coroutine_seterrno_f4           /* Set errno   */
+        mov     ecx, offset emsg_bigstack
+        call    coroutine_trypanic_f4           /* Freak out   */
+
+        mov     eax, 0                          /* Return NULL */
+        pop     ebp
+        ret
+
+Create_size_ok:
+
+        /* EDX is the total size of the stack and context. Stack is 8 bytes
+           off a 16 byte align. calloc WILL destroy registers/stack params */
+
+        sub     esp, 12
+        push    edx                             /* save EDX for later */
+
+        mov     eax, 1                          /* Wasn't happy to  */
+        push    eax                             /* push immediate.  */
+        push    edx                             /* @16 align now    */
+        call    calloc                          /* Memory is zeroed */
+        add     esp, 8                          /* double pop       */
+
+        pop     edx
+        add     esp, 12
+
+        /* EAX -> Allocated Memory. EDX = size of allocation */
+
+        cmp     eax, 0                          /* calloc returns 0? */
+        jne     Create_gotmem                   /* calloc sets errno */
+
+        mov     ecx, offset emsg_outofmem
+        call    coroutine_trypanic_f4
+
+        mov     eax, 0                          /* Return NULL */
+        pop     ebp
+        ret
+
+Create_gotmem:
+
+        mov     ecx, eax                        /* ECX -> calloced block */
+
+        mov     dword ptr [ecx + CTX_MAGIC], COROUTINE_MAGICVAL
+
+        mov     eax, [ebp + 8]                  /* First arg (checked ok)  */
+        mov     [ecx + CTX_COFUNCTION], eax     /* is pointer to coroutine */
+
+        /*
+         *  Create vstack in memory block after context strucure
+         *  Align the vstack top and bottom to 16 bytes and put in some
+         *  boundary detectors (0xdeadbeef) for the fun of it
+         *
+         *  ECX points to the start of the malloced block which is now
+         *  also the start of the context structure...
+         */
+
+        mov     eax, ecx                        /* EAX -> alloc block */
+        add     eax, CTX_STRUCTSIZE
+        add     eax, 15                         /* 16 byte align up */
+        and     eax, ~15                        /* (eax + 15) & ~15 */
+
+        /* EAX -> aligned memory from after context structure */
+
+        mov     dword ptr [eax +  0], 0xDEADBEEF
+        mov     dword ptr [eax +  4], 0xDEADBEEF
+        mov     dword ptr [eax +  8], 0xDEADBEEF
+        mov     dword ptr [eax + 12], 0xDEADBEEF
+
+        add     eax, 16                         /* vstacklow starts after */
+        mov     [ecx + CTX_VSTACKLOW], eax      /* the boundary dwords    */
+
+        mov     eax, ecx                        /* EAX -> block +         */
+        add     eax, edx                        /*     size, still in EDX */
+        and     eax, ~15                        /* Just in case!          */
+        sub     eax, 16                         /* And 16 bytes below top */
+        mov     [ecx + CTX_VSTACKHIGH], eax     /* is the vstackhigh addr */
+
+        mov     dword ptr [eax +  0], 0xDEADBEEF
+        mov     dword ptr [eax +  4], 0xDEADBEEF
+        mov     dword ptr [eax +  8], 0xDEADBEEF
+        mov     dword ptr [eax + 12], 0xDEADBEEF
+
+        /* Fill in the rest of the context structure information */
+
+#ifdef _WIN32
+        mov     eax, FS:[WINTIB_TIBADDR]        /* .wintib -> NT_TIB */
+        mov     [ecx + CTX_WINTIB], eax
+#endif
+
+        /* Everything else is 0 due to use of calloc */
+
+        mov     eax, ecx                        /* Return = context addr */
+        pop     ebp
+        ret
+
+
+
+
+/**
+ *  coroutine_destroy (__cdecl) - Free a coroutine context block
+ *
+ *  Takes the opaque pointer to the allocated context block and
+ *  frees the associated memory. Also overwrites the magic number.
+ *
+ *  Returns: 0 on success
+ *           -EINVAL on bad context, -EFAULT if on a coroutine stack
+ *  On error: sets errno, calls coroutine_trypanic
+ */
+
+coroutine_destroy:
+
+        push    ebp
+        mov     ebp, esp
+
+        mov     ecx, [ebp + 8]                  /* First arg */
+        call    coroutine_isvalidcontext_f4
+        cmp     eax, 0
+        jne     Destroy_context_ok
+
+        /* Bad context pointer */
+
+        mov     eax, -EINVAL
+        pop     ebp
+        ret
+
+Destroy_context_ok:
+
+        /*  ECX -> coroutine context structure
+         *  Check the vstack flag. Destroying our own stack
+         *  would be fairly messy...
+         */
+
+        cmp     dword ptr [ecx + CTX_ONVSTACK], 0
+        je      Destroy_stack_ok
+
+        mov     ecx, EFAULT
+        call    coroutine_seterrno_f4           /* Set errno   */
+        mov     ecx, offset emsg_badstack
+        call    coroutine_trypanic_f4           /* Panic */
+
+        mov     eax, -EFAULT
+        pop     ebp
+        ret
+
+Destroy_stack_ok:
+
+        /* ECX -> Context. It is valid, and we're on normal stack */
+
+        mov     dword ptr [ecx + CTX_MAGIC], 0
+
+        mov     eax, 0
+        push    eax
+        push    ecx
+        call    free
+        add     esp, 8                          /* two pops */
+
+        mov     eax, 0
+        pop     ebp
+        ret
+
+
+
+
+/**
+ *  coroutine_hasended (__cdecl) - Check the CTX_YIELDED entry
+ *
+ *  Takes the opaque pointer to the allocated context block
+ *  Returns: 0 if the coroutine is still yielding
+ *           1 if the coroutine has ended (or hasn't started)
+ *          -1 if the context is not valid (sets errno, calls trypanic)
+ */
+
+coroutine_hasended:
+
+        push    ebp
+        mov     ebp, esp
+
+        mov     ecx, [ebp + 8]                  /* First arg */
+        call    coroutine_isvalidcontext_f4
+        cmp     eax, 0
+        je      Hasended_error
+
+        mov     eax, [ecx + CTX_YIELDED]
+        xor     eax, 1
+        pop     ebp
+        ret
+
+Hasended_error:
+        mov     eax, -1
+        pop     ebp
+        ret
+
+
+
+
+/**
+ *  coroutine_getparam (__cdecl) - Get a pointer to the CTX_EXTRAPARAM entry
+ *
+ *  Takes the opaque pointer to the allocated context block
+ *  Returns a pointer to the context structure's extra parameter entry
+ *  Returns NULL on invalid context (sets errno, calls coroutine_trypanic)
+ */
+
+coroutine_getparam:
+
+        push    ebp
+        mov     ebp, esp
+
+        mov     ecx, [ebp + 8]                  /* First arg */
+        call    coroutine_isvalidcontext_f4
+        cmp     eax, 0
+        je      Getparam_exit                   /* Return NULL */
+
+        lea     eax, [ecx + CTX_EXTRAPARAM]     /* LEA is correct */
+
+Getparam_exit:
+        pop     ebp
+        ret
+
+
+
+
+/**
+ *  coroutine_call (__cdecl) - Call or yield back to the coroutine
+ *
+ *  Takes the opaque pointer to the allocated context block and calls or
+ *  yields back into the context coroutine. The coroutine can:
+ *
+ *    - call coroutine_yield to yield back here, in which case the return
+ *      value is always -EAGAIN and coroutine_hasended() returns false or
+ *
+ *    - exit normally with a return code, in which case the return value
+ *      is that return code and coroutine_hasended() returns true.
+ *
+ *  In the former case, this call will yield back to the instruction
+ *  following the call to coroutine_yield().
+ *
+ *  Given that I can clearly detect where I am, I've decided to merge
+ *  coroutine_call and coroutine_yield into the same function - they
+ *  take the same argument and can be distinguished by .onvstack member.
+ *
+ *  Returns: -EINVAL on bad context pointer,
+ *           -EAGAIN on yield from coroutine, 0 on return from yield()
+ */
+
+coroutine_call:
+
+        push    ebp
+        mov     ebp, esp
+
+        mov     ecx, [ebp + 8]                  /* First arg */
+        call    coroutine_isvalidcontext_f4
+        cmp     eax, 0
+        jne     Cocall_context_ok
+
+        /* Bad context pointer */
+
+        mov     eax, -EINVAL
+        pop     ebp
+        ret
+
+
+Cocall_context_ok:
+
+        /*  ECX -> coroutine context structure
+         *
+         *  Who are we? call() or yield()? .onvstack decides.
+         */
+
+        cmp     dword ptr [ecx + CTX_ONVSTACK], 0
+        jne     Coyield_function_enter
+
+
+        /*
+         *  On the normal stack: this is "coroutine_call()"
+         *                       --------------------------
+         *  Normal stack looks like:
+         *      [...] [context ptr] [ret to main] [ebp]
+         *
+         *  Have we previously yielded from the coroutine?
+         */
+
+        cmp     dword ptr [ecx + CTX_YIELDED], 0
+        jne     Cocall_had_yielded
+
+
+        /*
+         *  Not yielded. coroutine call starts from the beginning
+         *  .cofunction, .vstacklow, .vstackhigh, .wintib are set
+         */
+
+        mov     eax, [ecx + CTX_COFUNCTION]     /* .nextjump is to the */
+        mov     [ecx + CTX_NEXTJUMP], eax       /* start of coroutine  */
+
+
+        /*  Blank aligned vstack. We want the following:
+         *
+         *      [context pointer] <---- aligned on 16 bytes
+         *      [return address]  <---- set to Cocall_returnpoint
+         *               ^------------- .otherstack points here
+         */
+
+        mov     eax, [ecx + CTX_VSTACKHIGH]     /* EAX -> vstack         */
+        sub     eax, 16                         /* align vstack and      */
+        mov     [eax], ecx                      /* vpush context pointer */
+
+        sub     eax, 4
+        lea     edx, Cocall_returnpoint
+        mov     [eax], edx                      /* vpush return address */
+
+        mov     [ecx + CTX_OTHERSTACK], eax     /* .otherstack = vstack */
+
+        /* Now .nextjump -> coroutine, .otherstack -> vstack */
+
+
+Cocall_had_yielded:
+
+        /*
+         *  Save state - push everything to normal stack. Leave the
+         *  segment registers alone. Push the NT_TIB stack boundaries
+         *  (currently set to normal stack) as we'll be changing them
+         */
+
+#ifdef _WIN32
+        mov     edx, [ecx + CTX_WINTIB]
+        push    dword ptr [edx + WINTIB_STACKHI]
+        push    dword ptr [edx + WINTIB_STACKLO]
+#endif
+        pushad
+
+        /* Swap stacks: normal to vstack */
+
+        mov     eax, [ecx + CTX_OTHERSTACK]     /* EAX -> vstack    */
+        mov     [ecx + CTX_OTHERSTACK], esp     /* otherstack = ESP */
+        mov     esp, eax                        /* BAM! Stack swap  */
+
+        mov     dword ptr [ecx + CTX_ONVSTACK], 1
+
+
+        /* Using the vstack now */
+        /* Set NT_TIB ranges to the vstack */
+
+#ifdef _WIN32
+        mov     eax, [ecx + CTX_VSTACKHIGH]
+        mov     [edx + WINTIB_STACKHI], eax
+        mov     eax, [ecx + CTX_VSTACKLOW]
+        mov     [edx + WINTIB_STACKLO], eax
+#endif
+
+        /* .nextjump points into the coroutine */
+
+        push    dword ptr [ecx + CTX_NEXTJUMP]  /* Using ret to jump */
+
+        lea     eax, Cocall_returnpoint
+        mov     [ecx + CTX_NEXTJUMP], eax
+
+        /* .nextjump -> Cocall_returnpoint, .otherstack -> normal stack */
+
+        ret                                     /* jump into coroutine */
+
+
+Cocall_returnpoint:
+
+        /* Back from coroutine and on the virtual stack. We have:
+
+           - A normal return. The ret pop'ed the return address and the
+             next and last thing on the stack is the context pointer.
+             EAX will contain the return value so save that first.
+
+           - A yield. The yield must push the context pointer onto the
+             stack just before it leaps back here. .yielded is true and
+             no register values are valid. yield() sets EAX to -EAGAIN.
+        */
+
+        pop     ecx                             /* ECX -> context struct */
+
+        mov     [ecx + CTX_RETVALUE], eax       /* Save possible ret val */
+
+
+        /* Swap stacks: vstack to normal */
+
+        mov     eax, [ecx + CTX_OTHERSTACK]     /* EAX -> normal stack */
+        mov     [ecx + CTX_OTHERSTACK], esp     /* otherstack = ESP    */
+        mov     esp, eax                        /* ESP = normal stack  */
+
+        mov     dword ptr [ecx + CTX_ONVSTACK], 0
+
+
+        /*  Back on the normal stack which contains:
+         *
+         *      [context ptr][ret to main][ebp]
+         *      [NT normal stackhi][NT normal stacklo]   (if _WIN32)
+         *      [EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI]
+         *
+         *  Push state is that at the "Cocall_had_yielded:" label where:
+         *
+         *      EDX -> wintib, ECX -> context struct, EAX unknown
+         */
+
+        popad
+
+#ifdef _WIN32
+        pop     dword ptr [edx + WINTIB_STACKLO]
+        pop     dword ptr [edx + WINTIB_STACKHI]
+#endif
+
+        /* Set return value and exit */
+
+        mov     eax, [ecx + CTX_RETVALUE]
+        pop     ebp
+        ret
+
+
+
+
+Coyield_function_enter:
+
+        /*
+         *  On the virtual stack: this is "coroutine_yield()"
+         *                        ---------------------------
+         *  Vstack looks like:
+         *      [context ptr]
+         *        [ret back to Cocall_returnpoint]
+         *      [local coroutine variables]
+         *      [context ptr]
+         *        [ret back to coroutine]
+         *      [ebp]
+         *
+         *  And ECX -> coroutine context structure
+         */
+
+        mov     dword ptr [ecx + CTX_YIELDED], 1
+
+        pushad                                  /* Push all registers       */
+        push    ecx                             /* See @Cocall_returnpoint  */
+
+        /* .nextjump points to Cocall_returnpoint */
+
+        push    dword ptr [ecx + CTX_NEXTJUMP]  /* Using ret to jump */
+
+        lea     eax, Coyield_coresume
+        mov     [ecx + CTX_NEXTJUMP], eax
+
+        /* .nextjump -> Coyield_coresume */
+
+        mov     eax, -EAGAIN                    /* Return value and jump */
+        ret                                     /* to Cocall_returnpoint */
+
+
+Coyield_coresume:
+
+        /*
+         *  coroutine_call() resumes coroutine running by jumping here.
+         *
+         *  On virtual stack which is as above but with registers saved:
+         *      [.....]
+         *      [ret back to coroutine]
+         *      [ebp]
+         *      [all registers]     (pushed ECX pointed to context struct)
+         */
+
+        popad
+        mov     dword ptr [ecx + CTX_YIELDED], 0
+        mov     eax, 0
+        pop     ebp
+        ret
+
+
+
+
+.att_syntax
+
+
+/* end */
