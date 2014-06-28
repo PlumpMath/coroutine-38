@@ -1,0 +1,60 @@
+coroutine_setpanic (__cdecl) - Set a global function to handle panics
+
+    Takes a pointer to the function which is stored in g_coroutine_panicfn
+    This can be NULL which will stop the function being called.
+
+
+coroutine_creates (__cdecl) - Creates a coroutine context block
+
+    Takes a pointer to the coroutine function and a pointer to a stacksize.
+    Allocates and initialises a context block and stack memory area.
+    The stacksize is rounded up to 4096 and stacksizep can be NULL.
+
+    Returns: an opaque pointer to the allocated context block
+             or NULL on error (Invalid function, no memory)
+             Write the actual stacksize back to the stacksizep.
+    On error: sets errno, calls coroutine_trypanic
+
+
+coroutine_destroy (__cdecl) - Free a coroutine context block
+
+    Takes the opaque pointer to the allocated context block and
+    frees the associated memory. Also overwrites the magic number.
+
+    Returns: 0 on success
+             -EINVAL on bad context, -EFAULT if on a coroutine stack
+    On error: sets errno, calls coroutine_trypanic
+
+
+coroutine_hasended (__cdecl) - Check the CTX_YIELDED entry
+
+    Takes the opaque pointer to the allocated context block
+    Returns: 0 if the coroutine is still yielding
+             1 if the coroutine has ended (or hasn't started)
+            -1 if the context is not valid (sets errno, calls trypanic)
+
+
+coroutine_getparam (__cdecl) - Get a pointer to the CTX_EXTRAPARAM entry
+
+    Takes the opaque pointer to the allocated context block
+    Returns a pointer to the context structure's extra parameter entry
+    Returns NULL on invalid context (sets errno, calls coroutine_trypanic)
+
+
+coroutine_call (__cdecl) - Call or yield back to the coroutine
+
+    Takes the opaque pointer to the allocated context block and calls or
+    yields back into the context coroutine. The coroutine can:
+
+    - call coroutine_yield to yield back here, in which case the return
+    value is always -EAGAIN and coroutine_hasended() returns false or
+
+    - exit normally with a return code, in which case the return value
+    is that return code and coroutine_hasended() returns true.
+
+    In the former case, this call will yield back to the instruction
+    following the call to coroutine_yield().
+
+    Returns: -EINVAL on bad context pointer,
+             -EAGAIN on yield from coroutine, 0 on return from yield()
+
