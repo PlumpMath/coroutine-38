@@ -5,14 +5,6 @@
 #include "coroutine.h"
 
 
-void mypanicfunction(const char *msg)
-{
-    printf("Oh noes: Panic! Errno = %d\n", errno);
-    printf("Message = %s\n", msg);
-    exit(1);
-}
-
-
 int mycofunction(void *coctx)
 {
     int i = 0;
@@ -33,11 +25,7 @@ int main()
     int *coparam;
     int ret;
 
-    coroutine_setpanic(mypanicfunction);
-
     cocontextp = coroutine_create(mycofunction);
-    if (!cocontextp)
-        return 1;
 
     printf("Coroutine create complete\n");
     printf("Starting coroutine call\n");
